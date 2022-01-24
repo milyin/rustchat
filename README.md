@@ -17,3 +17,10 @@ Access command line in docker container
 ```
 docker run -it -p 80:8000 rustchat cmd.exe
 ```
+
+Upload docker container to Azure container registry
+```
+docker tag rustchat {repository}.azurecr.io/rustchat
+docker push {repository}.azurecr.io/rustchat
+
+```

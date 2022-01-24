@@ -1,2 +1,2 @@
-cargo build
+cargo build --release
 docker build -t rustchat .
