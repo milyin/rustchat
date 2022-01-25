@@ -24,3 +24,10 @@ az group create -n rustchat -l eastus2
 az acr create --resource-group rustchat --name rustchat --sku basic
 
 ```
+
+Upload docker container to Azure container registry
+```
+docker tag rustchat {repository}.azurecr.io/rustchat
+docker push {repository}.azurecr.io/rustchat
+
+```
