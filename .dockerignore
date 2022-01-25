@@ -1,4 +1,2 @@
 .git
-src
 target
-!target\release\chat.exe
