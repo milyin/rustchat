@@ -1,4 +1,4 @@
 FROM rustchat_build
 WORKDIR /rustchat
 EXPOSE 80
-CMD target/release/chat
+CMD hostname -I; target/release/chat
