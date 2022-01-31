@@ -1,4 +1,0 @@
-FROM rust:latest
-WORKDIR /rustchat
-COPY . .
-RUN ["cargo", "build", "--release"]

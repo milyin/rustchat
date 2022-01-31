@@ -1,11 +1,10 @@
 # rustchat
 Azure webapp deploy experimenent. Code is cloned from https://github.com/SergioBenitez/Rocket/tree/master/examples/chat
 
-Build docker container
-```
-docker build -f Dockerfile.build -t rustchat_build .
-docker build -f Dockerfile.configure -t rustchat .
-```
+Build docker container - use "update_builder.cmd" - for prearing local container "rust_builder" with fetched crates and "build.cmd" - 
+for build "rustchat" container from sources. Rerun update_builder.cmd each time when build.cmd itself spend time on repeated fetching
+of updated crates.
+TODO: get rid of update_builder.cmd and store cargo's cache locally instead of "rust_builder" container. Haven't found how to do this yet.
 
 Run docker container locally, access site on localhost:8000. Use '-it' is optional - it adds Ctrl-Break support and color 
 display on windows terminal
