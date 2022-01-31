@@ -1,14 +1,20 @@
-#[macro_use] extern crate rocket;
+#[macro_use]
+extern crate rocket;
 
-#[cfg(test)] mod tests;
 
-use rocket::{State, Shutdown};
-use rocket::fs::{relative, FileServer};
+#[cfg(test)]
+mod tests;
+
+use std::convert::Infallible;
+
 use rocket::form::Form;
-use rocket::response::stream::{EventStream, Event};
-use rocket::serde::{Serialize, Deserialize};
-use rocket::tokio::sync::broadcast::{channel, Sender, error::RecvError};
+use rocket::fs::{relative, FileServer};
+use rocket::request::{self, FromRequest};
+use rocket::response::stream::{Event, EventStream};
+use rocket::serde::{Deserialize, Serialize};
 use rocket::tokio::select;
+use rocket::tokio::sync::broadcast::{channel, error::RecvError, Sender};
+use rocket::{Request, Shutdown, State};
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, UriDisplayQuery))]
@@ -19,6 +25,21 @@ struct Message {
     #[field(validate = len(..20))]
     pub username: String,
     pub message: String,
+}
+
+struct User {
+    pub username: Option<String>,
+}
+
+#[async_trait]
+impl<'r> FromRequest<'r> for User {
+    type Error = Infallible;
+
+    async fn from_request(request: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
+        let username = request.headers().get_one("X-MS-CLIENT-PRINCIPAL-NAME");
+        let username = username.map(|v| v.to_string());
+        request::Outcome::Success(Self { username })
+    }
 }
 
 /// Returns an infinite stream of server-sent events. Each event is a message
@@ -44,15 +65,24 @@ async fn events(queue: &State<Sender<Message>>, mut end: Shutdown) -> EventStrea
 
 /// Receive a message from a form submission and broadcast it to any receivers.
 #[post("/message", data = "<form>")]
-fn post(form: Form<Message>, queue: &State<Sender<Message>>) {
+fn post(form: Form<Message>, user: User, queue: &State<Sender<Message>>) {
     // A send 'fails' if there are no active subscribers. That's okay.
-    let _res = queue.send(form.into_inner());
+    let mut message = form.into_inner();
+    if let Some(username) = user.username {
+        message.username = username;
+    }
+    let _res = queue.send(message);
+}
+
+#[get("/user")]
+fn user(user: User) -> String {
+    user.username.unwrap_or("anonymous".into())
 }
 
 #[launch]
 fn rocket() -> _ {
     rocket::build()
         .manage(channel::<Message>(1024).0)
-        .mount("/", routes![post, events])
+        .mount("/", routes![post, events, user])
         .mount("/", FileServer::from("static"))
 }
