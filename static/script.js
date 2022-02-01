@@ -8,7 +8,6 @@ let roomTemplate = document.getElementById('room');
 let messageTemplate = document.getElementById('message');
 
 let messageField = newMessageForm.querySelector("#message");
-let usernameField = newMessageForm.querySelector("#username");
 let roomNameField = newRoomForm.querySelector("#name");
 
 var STATE = {
@@ -139,13 +138,12 @@ function init() {
 
     const room = STATE.room;
     const message = messageField.value;
-    const username = usernameField.value || "guest";
-    if (!message || !username) return;
+    if (!message) return;
 
     if (STATE.connected) {
       fetch("/message", {
         method: "POST",
-        body: new URLSearchParams({ room, username, message }),
+        body: new URLSearchParams({ room, message }),
       }).then((response) => {
         if (response.ok) messageField.value = "";
       });
