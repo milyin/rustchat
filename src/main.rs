@@ -6,6 +6,10 @@ mod tests;
 
 use std::convert::Infallible;
 
+use azure_data_cosmos::clients::{CosmosClient, CosmosOptions};
+use azure_data_cosmos::prelude::AuthorizationToken;
+use azure_data_cosmos::resources::permission::AuthorizationTokenParseError;
+use azure_data_cosmos::ConsistencyLevel;
 use rocket::form::Form;
 use rocket::fs::FileServer;
 use rocket::request::{self, FromRequest};
@@ -14,6 +18,21 @@ use rocket::serde::{Deserialize, Serialize};
 use rocket::tokio::select;
 use rocket::tokio::sync::broadcast::{channel, error::RecvError, Sender};
 use rocket::{Request, Shutdown, State};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error(transparent)]
+    AuthorizationTokenParse(AuthorizationTokenParseError),
+}
+
+impl From<AuthorizationTokenParseError> for Error {
+    fn from(e: AuthorizationTokenParseError) -> Self {
+        Error::AuthorizationTokenParse(e)
+    }
+}
+
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, UriDisplayQuery))]
@@ -86,10 +105,58 @@ fn user(user: User) -> String {
     user.username.unwrap_or("anonymous".into())
 }
 
+// #[get("/db")]
+// fn db() -> String {
+//     let master_key = std::env::var("COSMOS_MASTER_KEY").expect("COSMOS_MASTER_KEY not set");
+//     let account = std::env::var("COSMOS_ACCOUNT").expect("COSMOS_ACCOUNT not set");
+//     let auth_token =
+//         AuthorizationToken::primary_from_base64(&master_key).expect("create auth token failed");
+//     let client = CosmosClient::new(account.clone(), auth_token, CosmosOptions::default());
+//     let q = client.create_database("rustchat").consistency_level(ConsistencyLevel::Eventual).
+//     let database_client = client.into_database_client("rustchat");
+//     let collection_client = database_client.into_collection_client("messages");
+
+//     format!("{master_key} {account}")
+// }
+
+struct DbConnection {
+    pub account: String,
+    pub master_key: String,
+    // cosmos_client: CosmosClient,
+}
+
+impl DbConnection {
+    fn new(account: String, master_key: String) -> Result<Self> {
+        // let auth_token = AuthorizationToken::primary_from_base64(&master_key)?;
+        // let cosmos_client =
+        //     CosmosClient::new(account.clone(), auth_token, CosmosOptions::default());
+        Ok(Self {
+            account,
+            master_key,
+            // cosmos_client,
+        })
+    }
+}
+
+#[get("/db")]
+fn db(state: &State<DbConnection>) -> String {
+    let master_key = &state.master_key;
+    let account = &state.account;
+    format!("{master_key} {account}")
+}
+
 #[launch]
 fn rocket() -> _ {
+    // let master_key = std::env::var("COSMOS_MASTER_KEY").expect("COSMOS_MASTER_KEY not set");
+    // let account = std::env::var("COSMOS_ACCOUNT").expect("COSMOS_ACCOUNT not set");
+    // let db_connection = DbConnection::new(account, master_key).expect("DbConnection:");
+    let master_key =
+        std::env::var("COSMOS_MASTER_KEY").unwrap_or("COSMOS_MASTER_KEY not set".into());
+    let account = std::env::var("COSMOS_ACCOUNT").unwrap_or("COSMOS_ACCOUNT not set".into());
+    let db_connection = DbConnection::new(account, master_key).expect("DbConnection:");
     rocket::build()
+        .manage(db_connection)
         .manage(channel::<Message>(1024).0)
-        .mount("/", routes![post, events, user])
+        .mount("/", routes![post, events, user, db])
         .mount("/", FileServer::from("static"))
 }
