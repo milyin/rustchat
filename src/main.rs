@@ -4,31 +4,47 @@ extern crate rocket;
 #[cfg(test)]
 mod tests;
 
-use std::convert::Infallible;
-
 use azure_data_cosmos::clients::{CosmosClient, CosmosOptions};
 use azure_data_cosmos::prelude::AuthorizationToken;
 use azure_data_cosmos::resources::permission::AuthorizationTokenParseError;
 use azure_data_cosmos::ConsistencyLevel;
+use futures::{FutureExt, StreamExt};
 use rocket::form::Form;
 use rocket::fs::FileServer;
 use rocket::request::{self, FromRequest};
 use rocket::response::stream::{Event, EventStream};
 use rocket::serde::{Deserialize, Serialize};
-use rocket::tokio::select;
-use rocket::tokio::sync::broadcast::{channel, error::RecvError, Sender};
+use rocket::tokio::sync::broadcast::{channel, Sender};
+use rocket::tokio::sync::mpsc::error::SendError;
+use rocket::tokio::sync::{mpsc, oneshot};
+use rocket::tokio::task::LocalSet;
+use rocket::tokio::{self, select, task};
 use rocket::{Request, Shutdown, State};
+use std::convert::Infallible;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
     #[error(transparent)]
     AuthorizationTokenParse(AuthorizationTokenParseError),
+    #[error("Failed to communicate with DB access thread")]
+    DbThreadError,
 }
 
 impl From<AuthorizationTokenParseError> for Error {
     fn from(e: AuthorizationTokenParseError) -> Self {
         Error::AuthorizationTokenParse(e)
+    }
+}
+impl From<SendError<DbTask>> for Error {
+    fn from(e: SendError<DbTask>) -> Self {
+        Error::DbThreadError
+    }
+}
+
+impl From<oneshot::error::RecvError> for Error {
+    fn from(e: oneshot::error::RecvError) -> Self {
+        Error::DbThreadError
     }
 }
 
@@ -76,8 +92,8 @@ async fn events(queue: &State<Sender<Message>>, mut end: Shutdown) -> EventStrea
             let msg = select! {
                 msg = rx.recv() => match msg {
                     Ok(msg) => msg,
-                    Err(RecvError::Closed) => break,
-                    Err(RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 },
                 _ = &mut end => break,
             };
@@ -119,41 +135,96 @@ fn user(user: User) -> String {
 //     format!("{master_key} {account}")
 // }
 
+enum DbTask {
+    GetTables(oneshot::Sender<Vec<String>>),
+}
+
 struct DbConnection {
-    pub account: String,
-    pub master_key: String,
-    // cosmos_client: CosmosClient,
+    send: mpsc::UnboundedSender<DbTask>,
 }
 
 impl DbConnection {
     fn new(account: String, master_key: String) -> Result<Self> {
-        // let auth_token = AuthorizationToken::primary_from_base64(&master_key)?;
-        // let cosmos_client =
-        //     CosmosClient::new(account.clone(), auth_token, CosmosOptions::default());
-        Ok(Self {
-            account,
-            master_key,
-            // cosmos_client,
-        })
+        let auth_token = AuthorizationToken::primary_from_base64(&master_key)?;
+        let client = CosmosClient::new(account.clone(), auth_token, CosmosOptions::default());
+
+        dbg!(&account);
+        dbg!(&master_key);
+
+        let (send, mut recv) = mpsc::unbounded_channel();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        std::thread::spawn(move || {
+            let local = LocalSet::new();
+
+            local.spawn_local(async move {
+                dbg!("start");
+                while let Some(task) = recv.recv().await {
+                    let client = client.clone();
+                    match task {
+                        DbTask::GetTables(response) => {
+                            tokio::task::spawn_local(async move {
+                                let _ = response.send(Self::get_tables_impl(client).await);
+                            });
+                        }
+                    }
+                }
+                // If the while loop returns, then all the LocalSpawner
+                // objects have have been dropped.
+            });
+
+            // This will return once all senders are dropped and all
+            // spawned tasks have returned.
+            rt.block_on(local);
+        });
+
+        Ok(Self { send })
+    }
+
+    async fn get_tables_impl(client: CosmosClient) -> Vec<String> {
+        dbg!("get_tables_impl");
+        let mut list = Vec::new();
+        let mut dbs = client.list_databases().into_stream();
+        while let Some(Ok(db)) = dbs.next().await {
+            let dbs = db
+                .databases
+                .iter()
+                .map(|v| v.id.as_ref())
+                .collect::<Vec<_>>()
+                .join(",");
+            list.push(dbs);
+        }
+        list
+    }
+
+    pub async fn get_tables(&self) -> Result<Vec<String>> {
+        dbg!("get_tables");
+        let (send, response) = oneshot::channel();
+        let task = DbTask::GetTables(send);
+        self.send.send(task)?;
+        Ok(response.await?)
     }
 }
 
 #[get("/db")]
-fn db(state: &State<DbConnection>) -> String {
-    let master_key = &state.master_key;
-    let account = &state.account;
-    format!("{master_key} {account}")
+async fn db(state: &State<DbConnection>) -> String {
+    let tables = state.get_tables().await.unwrap_or(Vec::new()); // TODO: fire error 500
+    tables.join(",")
 }
 
 #[launch]
 fn rocket() -> _ {
-    // let master_key = std::env::var("COSMOS_MASTER_KEY").expect("COSMOS_MASTER_KEY not set");
-    // let account = std::env::var("COSMOS_ACCOUNT").expect("COSMOS_ACCOUNT not set");
-    // let db_connection = DbConnection::new(account, master_key).expect("DbConnection:");
-    let master_key =
-        std::env::var("COSMOS_MASTER_KEY").unwrap_or("COSMOS_MASTER_KEY not set".into());
-    let account = std::env::var("COSMOS_ACCOUNT").unwrap_or("COSMOS_ACCOUNT not set".into());
-    let db_connection = DbConnection::new(account, master_key).expect("DbConnection:");
+    let master_key = std::env::var("COSMOS_MASTER_KEY").expect("env var COSMOS_MASTER_KEY");
+    let account = std::env::var("COSMOS_ACCOUNT").expect("env var COSMOS_ACCOUNT");
+
+    dbg!(&account);
+    dbg!(&master_key);
+
+    let db_connection = DbConnection::new(account, master_key).expect("DbConnection::new");
     rocket::build()
         .manage(db_connection)
         .manage(channel::<Message>(1024).0)

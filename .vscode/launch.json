@@ -13,7 +13,11 @@
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
-            "console": "externalTerminal"
+            "console": "externalTerminal",
+            "env": {
+                "COSMOS_MASTER_KEY": "3ReNJC3WOX5zTcvp9nB1XMOUFX0INh55LGbiZKyxQSy2raXc8mGbZwGYWL1FjUJ0hNEzaCyaxviVrcUkx7tbBQ==",
+                "COSMOS_ACCOUNT": "https://rustchat.documents.azure.com:443/"
+            },
         },
     ]
 }
