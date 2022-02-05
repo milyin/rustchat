@@ -5,10 +5,9 @@ extern crate rocket;
 mod tests;
 
 use azure_data_cosmos::clients::{CosmosClient, CosmosOptions};
-use azure_data_cosmos::prelude::AuthorizationToken;
+use azure_data_cosmos::prelude::{AuthorizationToken, CreateDocumentOptions};
 use azure_data_cosmos::resources::permission::AuthorizationTokenParseError;
-use azure_data_cosmos::ConsistencyLevel;
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use rocket::form::Form;
 use rocket::fs::FileServer;
 use rocket::request::{self, FromRequest};
@@ -18,7 +17,7 @@ use rocket::tokio::sync::broadcast::{channel, Sender};
 use rocket::tokio::sync::mpsc::error::SendError;
 use rocket::tokio::sync::{mpsc, oneshot};
 use rocket::tokio::task::LocalSet;
-use rocket::tokio::{self, select, task};
+use rocket::tokio::{self, select};
 use rocket::{Request, Shutdown, State};
 use std::convert::Infallible;
 use thiserror::Error;
@@ -37,13 +36,13 @@ impl From<AuthorizationTokenParseError> for Error {
     }
 }
 impl From<SendError<DbTask>> for Error {
-    fn from(e: SendError<DbTask>) -> Self {
+    fn from(_e: SendError<DbTask>) -> Self {
         Error::DbThreadError
     }
 }
 
 impl From<oneshot::error::RecvError> for Error {
-    fn from(e: oneshot::error::RecvError) -> Self {
+    fn from(_e: oneshot::error::RecvError) -> Self {
         Error::DbThreadError
     }
 }
@@ -65,6 +64,22 @@ struct MessageForm {
     #[field(validate = len(..30))]
     pub room: String,
     pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct MessageDocument {
+    id: String,
+    timestamp: i64,
+    message: Message,
+}
+
+impl<'a> azure_data_cosmos::CosmosEntity<'a> for MessageDocument {
+    type Entity = i64;
+
+    fn partition_key(&'a self) -> Self::Entity {
+        self.timestamp
+    }
 }
 
 struct User {
@@ -105,7 +120,12 @@ async fn events(queue: &State<Sender<Message>>, mut end: Shutdown) -> EventStrea
 
 /// Receive a message from a form submission and broadcast it to any receivers.
 #[post("/message", data = "<form>")]
-fn post(form: Form<MessageForm>, user: User, queue: &State<Sender<Message>>) {
+fn post(
+    form: Form<MessageForm>,
+    user: User,
+    queue: &State<Sender<Message>>,
+    state: &State<DbConnection>,
+) {
     // A send 'fails' if there are no active subscribers. That's okay.
     let form = form.into_inner();
     let message = Message {
@@ -113,7 +133,8 @@ fn post(form: Form<MessageForm>, user: User, queue: &State<Sender<Message>>) {
         username: user.username.unwrap_or("guest".into()),
         message: form.message,
     };
-    let _res = queue.send(message);
+    let _ = state.save_message(message.clone());
+    let _ = queue.send(message);
 }
 
 #[get("/user")]
@@ -137,6 +158,7 @@ fn user(user: User) -> String {
 
 enum DbTask {
     GetTables(oneshot::Sender<Vec<String>>),
+    SaveMessage(Message),
 }
 
 struct DbConnection {
@@ -144,12 +166,9 @@ struct DbConnection {
 }
 
 impl DbConnection {
-    fn new(account: String, master_key: String) -> Result<Self> {
+    fn new(account: String, master_key: String, database_name: String) -> Result<Self> {
         let auth_token = AuthorizationToken::primary_from_base64(&master_key)?;
         let client = CosmosClient::new(account.clone(), auth_token, CosmosOptions::default());
-
-        dbg!(&account);
-        dbg!(&master_key);
 
         let (send, mut recv) = mpsc::unbounded_channel();
 
@@ -162,13 +181,18 @@ impl DbConnection {
             let local = LocalSet::new();
 
             local.spawn_local(async move {
-                dbg!("start");
                 while let Some(task) = recv.recv().await {
                     let client = client.clone();
                     match task {
                         DbTask::GetTables(response) => {
                             tokio::task::spawn_local(async move {
                                 let _ = response.send(Self::get_tables_impl(client).await);
+                            });
+                        }
+                        DbTask::SaveMessage(message) => {
+                            let database = database_name.clone();
+                            tokio::task::spawn_local(async move {
+                                Self::save_message_impl(client, database, message).await;
                             });
                         }
                     }
@@ -186,7 +210,6 @@ impl DbConnection {
     }
 
     async fn get_tables_impl(client: CosmosClient) -> Vec<String> {
-        dbg!("get_tables_impl");
         let mut list = Vec::new();
         let mut dbs = client.list_databases().into_stream();
         while let Some(Ok(db)) = dbs.next().await {
@@ -202,11 +225,32 @@ impl DbConnection {
     }
 
     pub async fn get_tables(&self) -> Result<Vec<String>> {
-        dbg!("get_tables");
         let (send, response) = oneshot::channel();
         let task = DbTask::GetTables(send);
         self.send.send(task)?;
         Ok(response.await?)
+    }
+
+    async fn save_message_impl(client: CosmosClient, database_name: String, message: Message) {
+        let database_client = client.into_database_client(database_name);
+        let collection_client = database_client.into_collection_client("messages");
+        let timestamp = chrono::Utc::now().timestamp();
+        let document = MessageDocument {
+            id: format!("{}_{}", message.username, timestamp),
+            timestamp,
+            message,
+        };
+        let options = CreateDocumentOptions::new();
+        let q = collection_client
+            .create_document(azure_core::Context::new(), &document, options)
+            .await;
+        dbg!(q);
+    }
+
+    fn save_message(&self, message: Message) -> Result<()> {
+        let task = DbTask::SaveMessage(message);
+        self.send.send(task)?;
+        Ok(())
     }
 }
 
@@ -221,10 +265,8 @@ fn rocket() -> _ {
     let master_key = std::env::var("COSMOS_MASTER_KEY").expect("env var COSMOS_MASTER_KEY");
     let account = std::env::var("COSMOS_ACCOUNT").expect("env var COSMOS_ACCOUNT");
 
-    dbg!(&account);
-    dbg!(&master_key);
-
-    let db_connection = DbConnection::new(account, master_key).expect("DbConnection::new");
+    let db_connection =
+        DbConnection::new(account, master_key, "rustchat".into()).expect("DbConnection::new");
     rocket::build()
         .manage(db_connection)
         .manage(channel::<Message>(1024).0)
